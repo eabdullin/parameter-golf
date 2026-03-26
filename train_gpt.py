@@ -69,6 +69,10 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    encoder_ratio = float(os.environ.get("ENCODER_RATIO", 0.2))
+    latent_loss_lambda = float(os.environ.get("LATENT_LOSS_LAMBDA", 0.0))
+    sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.0))
+    sigreg_num_slices = int(os.environ.get("SIGREG_NUM_SLICES", 256))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -256,7 +260,8 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss, _, _ = model(x, y)
+                batch_loss = batch_loss.detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -497,6 +502,36 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
+class SIGReg(nn.Module):
+    # LeJEPA SIGReg: Sketched Isotropic Gaussian Regularization.
+    # Encourages latent embeddings toward an isotropic Gaussian via characteristic-function matching.
+    # Reference: Balestriero & LeCun, arXiv:2511.08544
+    def __init__(self, num_slices: int = 256, knots: int = 17, t_max: float = 3.0):
+        super().__init__()
+        self.num_slices = num_slices
+        t = torch.linspace(0, t_max, knots, dtype=torch.float32)
+        dt = t_max / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, S, D) — treat S positions as samples, D as embedding dim
+        with torch.no_grad():
+            A = torch.randn(x.size(-1), self.num_slices, device=x.device, dtype=x.dtype)
+            A = A / A.norm(p=2, dim=0)
+        x_proj = x @ A                          # (B, S, num_slices)
+        x_t = x_proj.unsqueeze(-1) * self.t     # (B, S, num_slices, knots)
+        cos_mean = x_t.cos().mean(-3)            # (B, num_slices, knots)  — avg over S
+        sin_mean = x_t.sin().mean(-3)
+        err = (cos_mean - self.phi).square() + sin_mean.square()
+        statistic = (err @ self.weights) * x.size(-2)  # scale by num samples
+        return statistic.mean()
+
+
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -659,6 +694,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        encoder_ratio: float = 0.5,
+        num_slices: int = 256,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +703,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.latent_split_layer = max(1, round(num_layers * encoder_ratio))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -684,6 +722,7 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        self.sigreg = SIGReg(num_slices=num_slices)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -697,20 +736,28 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        encoder_latent = x
+        block_count = 0
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+            block_count += 1
+            if block_count == self.latent_split_layer:
+                encoder_latent = x
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_count += 1
+            if block_count == self.latent_split_layer:
+                encoder_latent = x
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -721,7 +768,17 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        # Latent prediction loss: position i predicts position i+1 latent
+        pred = encoder_latent[:, :-1, :]
+        tgt = encoder_latent[:, 1:, :].detach()
+        latent_loss = F.smooth_l1_loss(pred, tgt)
+
+        # SIGReg loss on encoder latents (LeJEPA regularization)
+        sigreg_loss = self.sigreg(encoder_latent)
+
+        return ce_loss, latent_loss, sigreg_loss
 
 
 # -----------------------------
@@ -835,6 +892,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        encoder_ratio=args.encoder_ratio,
+        num_slices=args.sigreg_num_slices,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -894,6 +953,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"encoder_ratio:{args.encoder_ratio} latent_split_layer:{base_model.latent_split_layer} latent_loss_lambda:{args.latent_loss_lambda} sigreg_lambda:{args.sigreg_lambda}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -945,7 +1005,8 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_ce, warmup_latent, warmup_sigreg = model(x, y)
+                    warmup_loss = warmup_ce + args.latent_loss_lambda * warmup_latent + args.sigreg_lambda * warmup_sigreg
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1007,16 +1068,23 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
-        train_loss = torch.zeros((), device=device)
+        train_ce_loss = torch.zeros((), device=device)
+        train_latent_loss = torch.zeros((), device=device)
+        train_sigreg_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
+                ce_loss, latent_loss, sigreg_loss = model(x, y)
+            loss = ce_loss + args.latent_loss_lambda * latent_loss + args.sigreg_lambda * sigreg_loss
+            train_ce_loss += ce_loss.detach()
+            train_latent_loss += latent_loss.detach()
+            train_sigreg_loss += sigreg_loss.detach()
             (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
+        train_ce_loss /= grad_accum_steps
+        train_latent_loss /= grad_accum_steps
+        train_sigreg_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1040,8 +1108,12 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            train_total = (train_ce_loss.item() + args.latent_loss_lambda * train_latent_loss.item()
+                           + args.sigreg_lambda * train_sigreg_loss.item())
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} train_loss:{train_total:.4f} "
+                f"ce_loss:{train_ce_loss.item():.4f} latent_loss:{train_latent_loss.item():.4f} "
+                f"sigreg_loss:{train_sigreg_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
