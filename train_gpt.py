@@ -6,6 +6,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import copy
 import glob
 import io
@@ -69,6 +70,9 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    num_loops = int(os.environ.get("NUM_LOOPS", 1))
+    val_num_loops = int(os.environ.get("VAL_NUM_LOOPS", 0))  # 0 = same as num_loops
+    loop_full_grad_frac = float(os.environ.get("LOOP_FULL_GRAD_FRAC", 0.1))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -227,6 +231,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    val_num_loops: int | None = None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -256,7 +261,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y, num_loops=val_num_loops).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -659,6 +664,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_loops: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +672,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_loops = num_loops
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -697,10 +704,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+    def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
@@ -711,6 +715,29 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return x
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        num_loops: int | None = None,
+        detach_early_loops: bool = False,
+    ) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+
+        loops = num_loops if num_loops is not None else self.num_loops
+        # Latent looping: reuse the same block stack multiple times.
+        # When detach_early_loops=True, detach hidden states between loops so
+        # gradients don't flow back through earlier loops (saves backward compute).
+        for loop_step in range(loops):
+            ctx = torch.no_grad() if detach_early_loops and loop_step < loops - 1 else nullcontext()
+            with ctx:
+                x = self._run_blocks(x, x0)
+            if loop_step < loops - 1:
+                x = F.rms_norm(x, (x.size(-1),))
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -835,6 +862,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_loops=args.num_loops,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -897,6 +925,8 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    effective_val_loops = args.val_num_loops if args.val_num_loops > 0 else args.num_loops
+    log0(f"num_loops:{args.num_loops} val_num_loops:{effective_val_loops} loop_full_grad_frac:{args.loop_full_grad_frac}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -939,13 +969,15 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
+            # Alternate warmup steps between full-grad and detach paths to prime both.
+            warmup_detach = args.num_loops > 1 and warmup_step % 2 == 1
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, detach_early_loops=warmup_detach)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -988,6 +1020,7 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                val_num_loops=args.num_loops,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1007,13 +1040,15 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
+        # Randomly decide whether to use full gradient through all loops.
+        detach_early = args.num_loops > 1 and random.random() >= args.loop_full_grad_frac
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, detach_early_loops=detach_early)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1110,6 +1145,7 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        val_num_loops=effective_val_loops,
     )
     torch.cuda.synchronize()
     log0(
