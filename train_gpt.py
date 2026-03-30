@@ -71,6 +71,8 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     encoder_ratio = float(os.environ.get("ENCODER_RATIO", 0.2))
     latent_loss_lambda = float(os.environ.get("LATENT_LOSS_LAMBDA", 0.0))
+    latent_patch_size = int(os.environ.get("LATENT_PATCH_SIZE", 4))
+    latent_patch_temperature = float(os.environ.get("LATENT_PATCH_TEMPERATURE", 2.0))
     sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.0))
     sigreg_num_slices = int(os.environ.get("SIGREG_NUM_SLICES", 256))
 
@@ -294,7 +296,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain",
     ).split(",")
     if pattern
 )
@@ -695,20 +697,24 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         encoder_ratio: float = 0.5,
+        latent_patch_size: int = 4,
+        latent_patch_temperature: float = 2.0,
         num_slices: int = 256,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if latent_patch_size <= 0:
+            raise ValueError(f"latent_patch_size must be positive, got {latent_patch_size}")
+        if latent_patch_temperature <= 0.0:
+            raise ValueError(f"latent_patch_temperature must be positive, got {latent_patch_temperature}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.latent_split_layer = max(1, round(num_layers * encoder_ratio))
+        self.latent_patch_size = latent_patch_size
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
+        self.num_encoder_layers = int(max(1, round(num_layers * encoder_ratio)))
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -722,6 +728,12 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        self.latent_patch_gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+        self.latent_patch_logit_scale = nn.Parameter(
+            torch.tensor(math.log(latent_patch_temperature), dtype=torch.float32)
+        )
+        self.latent_predictor_norm = RMSNorm()
+        self.latent_predictor = CastedLinear(model_dim, model_dim, bias=False)
         self.sigreg = SIGReg(num_slices=num_slices)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -736,28 +748,36 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _reshape_patches(self, x: Tensor) -> Tensor:
+        usable = (x.size(1) // self.latent_patch_size) * self.latent_patch_size
+        if usable <= 0:
+            return x[:, :0, :].reshape(x.size(0), 0, self.latent_patch_size, x.size(-1))
+        return x[:, :usable, :].reshape(x.size(0), usable // self.latent_patch_size, self.latent_patch_size, x.size(-1))
+
+    def _pool_decoder_patches(self, patches: Tensor) -> Tensor:
+        if patches.size(1) == 0:
+            return patches[:, :, 0, :]
+        if patches.size(2) == 1:
+            return patches.squeeze(2)
+        gate_inputs = F.rms_norm(patches, (patches.size(-1),))
+        logits = (gate_inputs * self.latent_patch_gate.to(dtype=patches.dtype)[None, None, None, :]).sum(dim=-1)
+        logit_scale = self.latent_patch_logit_scale.exp().to(dtype=patches.dtype)
+        weights = F.softmax(logits * logit_scale, dim=-1)
+        return (weights[..., None] * patches).sum(dim=2)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
         encoder_latent = x
-        block_count = 0
 
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
-            skips.append(x)
-            block_count += 1
-            if block_count == self.latent_split_layer:
-                encoder_latent = x
+        encoder_latent = x
+
         for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-            block_count += 1
-            if block_count == self.latent_split_layer:
-                encoder_latent = x
+            x = self.blocks[self.num_encoder_layers + i](x, encoder_latent)
+        decoder_latent = x
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -770,10 +790,18 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
-        # Latent prediction loss: position i predicts position i+1 latent
-        pred = encoder_latent[:, :-1, :]
-        tgt = encoder_latent[:, 1:, :].detach()
-        latent_loss = F.smooth_l1_loss(pred, tgt)
+        # Patch-level JEPA: use a learned intra-patch gate on decoder latents to predict
+        # the next encoder patch latent, which is a slower and less noisy target than tokens.
+        encoder_patches = self._reshape_patches(encoder_latent)
+        decoder_patches = self._reshape_patches(decoder_latent)
+        if encoder_patches.size(1) <= 1 or decoder_patches.size(1) <= 1:
+            latent_loss = ce_loss.new_zeros(())
+        else:
+            pred_patches = self._pool_decoder_patches(decoder_patches)
+            pred_patches = self.latent_predictor(self.latent_predictor_norm(pred_patches))
+            pred = F.normalize(pred_patches[:, :-1, :].float(), dim=-1)
+            tgt = F.normalize(encoder_patches.mean(dim=2)[:, 1:, :].detach().float(), dim=-1)
+            latent_loss = (1.0 - (pred * tgt).sum(dim=-1)).mean()
 
         # SIGReg loss on encoder latents (LeJEPA regularization)
         sigreg_loss = self.sigreg(encoder_latent)
@@ -893,6 +921,8 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         encoder_ratio=args.encoder_ratio,
+        latent_patch_size=args.latent_patch_size,
+        latent_patch_temperature=args.latent_patch_temperature,
         num_slices=args.sigreg_num_slices,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -908,18 +938,30 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    aux_named_params = [
+        (name, p)
+        for name, p in base_model.named_parameters()
+        if not name.startswith("tok_emb.") and not name.startswith("blocks.") and not name.startswith("lm_head.")
+    ]
     matrix_params = [
         p
         for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ] + [
+        p
+        for name, p in aux_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ] + [
+        p
+        for name, p in aux_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -953,7 +995,11 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"encoder_ratio:{args.encoder_ratio} latent_split_layer:{base_model.latent_split_layer} latent_loss_lambda:{args.latent_loss_lambda} sigreg_lambda:{args.sigreg_lambda}")
+    log0(
+        f"encoder_ratio:{args.encoder_ratio} latent_loss_lambda:{args.latent_loss_lambda} "
+        f"latent_patch_size:{args.latent_patch_size} latent_patch_temperature:{args.latent_patch_temperature} "
+        f"sigreg_lambda:{args.sigreg_lambda}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
