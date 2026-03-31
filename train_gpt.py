@@ -24,6 +24,7 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from latent_patching import CastedLinear, LatentPatching, RMSNorm
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -534,22 +535,6 @@ class SIGReg(nn.Module):
         return statistic.mean()
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, eps: float | None = None):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
-
-
-class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    def forward(self, x: Tensor) -> Tensor:
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
-
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -704,14 +689,9 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if latent_patch_size <= 0:
-            raise ValueError(f"latent_patch_size must be positive, got {latent_patch_size}")
-        if latent_patch_temperature <= 0.0:
-            raise ValueError(f"latent_patch_temperature must be positive, got {latent_patch_temperature}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.latent_patch_size = latent_patch_size
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = int(max(1, round(num_layers * encoder_ratio)))
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -728,12 +708,7 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.latent_patch_gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
-        self.latent_patch_logit_scale = nn.Parameter(
-            torch.tensor(math.log(latent_patch_temperature), dtype=torch.float32)
-        )
-        self.latent_predictor_norm = RMSNorm()
-        self.latent_predictor = CastedLinear(model_dim, model_dim, bias=False)
+        self.latent_patching = LatentPatching(model_dim, latent_patch_size, latent_patch_temperature)
         self.sigreg = SIGReg(num_slices=num_slices)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -747,23 +722,6 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
-
-    def _reshape_patches(self, x: Tensor) -> Tensor:
-        usable = (x.size(1) // self.latent_patch_size) * self.latent_patch_size
-        if usable <= 0:
-            return x[:, :0, :].reshape(x.size(0), 0, self.latent_patch_size, x.size(-1))
-        return x[:, :usable, :].reshape(x.size(0), usable // self.latent_patch_size, self.latent_patch_size, x.size(-1))
-
-    def _pool_decoder_patches(self, patches: Tensor) -> Tensor:
-        if patches.size(1) == 0:
-            return patches[:, :, 0, :]
-        if patches.size(2) == 1:
-            return patches.squeeze(2)
-        gate_inputs = F.rms_norm(patches, (patches.size(-1),))
-        logits = (gate_inputs * self.latent_patch_gate.to(dtype=patches.dtype)[None, None, None, :]).sum(dim=-1)
-        logit_scale = self.latent_patch_logit_scale.exp().to(dtype=patches.dtype)
-        weights = F.softmax(logits * logit_scale, dim=-1)
-        return (weights[..., None] * patches).sum(dim=2)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x = self.tok_emb(input_ids)
@@ -792,16 +750,7 @@ class GPT(nn.Module):
 
         # Patch-level JEPA: use a learned intra-patch gate on decoder latents to predict
         # the next encoder patch latent, which is a slower and less noisy target than tokens.
-        encoder_patches = self._reshape_patches(encoder_latent)
-        decoder_patches = self._reshape_patches(decoder_latent)
-        if encoder_patches.size(1) <= 1 or decoder_patches.size(1) <= 1:
-            latent_loss = ce_loss.new_zeros(())
-        else:
-            pred_patches = self._pool_decoder_patches(decoder_patches)
-            pred_patches = self.latent_predictor(self.latent_predictor_norm(pred_patches))
-            pred = F.normalize(pred_patches[:, :-1, :].float(), dim=-1)
-            tgt = F.normalize(encoder_patches.mean(dim=2)[:, 1:, :].detach().float(), dim=-1)
-            latent_loss = (1.0 - (pred * tgt).sum(dim=-1)).mean()
+        latent_loss = self.latent_patching.loss(encoder_latent, decoder_latent, ce_loss)
 
         # SIGReg loss on encoder latents (LeJEPA regularization)
         sigreg_loss = self.sigreg(encoder_latent)
