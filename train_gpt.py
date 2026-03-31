@@ -24,7 +24,6 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from latent_patching import CastedLinear, LatentPatching, RMSNorm
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -74,6 +73,8 @@ class Hyperparameters:
     latent_loss_lambda = float(os.environ.get("LATENT_LOSS_LAMBDA", 0.0))
     latent_patch_size = int(os.environ.get("LATENT_PATCH_SIZE", 4))
     latent_patch_temperature = float(os.environ.get("LATENT_PATCH_TEMPERATURE", 2.0))
+    boundary_temperature = float(os.environ.get("BOUNDARY_TEMPERATURE", 1.0))
+    boundary_sharpness = float(os.environ.get("BOUNDARY_SHARPNESS", 4.0))
     sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.0))
     sigreg_num_slices = int(os.environ.get("SIGREG_NUM_SLICES", 256))
 
@@ -505,6 +506,107 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
+class RMSNorm(nn.Module):
+    def __init__(self, eps: float | None = None):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+
+
+class CastedLinear(nn.Linear):
+    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    def forward(self, x: Tensor) -> Tensor:
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(x.dtype), bias)
+
+
+class LatentPatching(nn.Module):
+    # Dynamic patching: a learned boundary scorer assigns each token a split probability,
+    # creating soft patch assignments via cumulative boundary mass. The gate then selects
+    # representative tokens within each dynamic patch for next-patch prediction.
+    def __init__(
+        self,
+        model_dim: int,
+        target_patch_size: int,
+        patch_temperature: float,
+        boundary_temperature: float = 1.0,
+        boundary_sharpness: float = 4.0,
+    ):
+        super().__init__()
+        if target_patch_size <= 0:
+            raise ValueError(f"latent_patch_size must be positive, got {target_patch_size}")
+        if patch_temperature <= 0.0:
+            raise ValueError(f"latent_patch_temperature must be positive, got {patch_temperature}")
+
+        self.target_patch_size = target_patch_size
+        self.boundary_sharpness = boundary_sharpness
+        # Boundary scorer: predicts how likely each token is to start a new patch.
+        self.boundary_proj = CastedLinear(model_dim, 1, bias=True)
+        self.boundary_temperature = nn.Parameter(
+            torch.tensor(math.log(boundary_temperature), dtype=torch.float32)
+        )
+        # Within-patch gating: selects representative tokens for decoder pooling.
+        self.gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(patch_temperature), dtype=torch.float32))
+        self.predictor_norm = RMSNorm()
+        self.predictor = CastedLinear(model_dim, model_dim, bias=False)
+
+    def compute_assignments(self, x: Tensor) -> Tensor:
+        # x: (B, S, D) -> returns assignment matrix A: (B, num_patches, S)
+        B, S, D = x.shape
+        num_patches = max(1, S // self.target_patch_size)
+        if num_patches <= 1:
+            return x.new_ones(B, 1, S) / S
+
+        # Boundary logits from content
+        boundary_logits = self.boundary_proj(F.rms_norm(x, (D,))).squeeze(-1)  # (B, S)
+        tau = self.boundary_temperature.exp()
+        boundary_prob = torch.sigmoid(boundary_logits / tau.to(dtype=boundary_logits.dtype))  # (B, S)
+
+        # Cumulative boundary mass -> monotonic position signal
+        cum_bound = torch.cumsum(boundary_prob, dim=-1)  # (B, S) values ~0..S
+        # Normalize to [0, num_patches] range
+        cum_norm = cum_bound * (num_patches / cum_bound[:, -1:].clamp(min=1.0))  # (B, S)
+
+        # Patch centers at 0.5, 1.5, ..., num_patches-0.5
+        centers = torch.arange(num_patches, device=x.device, dtype=x.dtype) + 0.5  # (num_patches,)
+
+        # Soft assignment: each patch attends to tokens near its center in cumulative space
+        # distance: (B, num_patches, S)
+        dist = (cum_norm[:, None, :] - centers[None, :, None]).abs()
+        A = F.softmax(-dist * self.boundary_sharpness, dim=-1)  # (B, num_patches, S)
+        return A
+
+    def loss(self, encoder_latent: Tensor, decoder_latent: Tensor, loss_ref: Tensor) -> Tensor:
+        B, S, D = decoder_latent.shape
+        num_patches = max(1, S // self.target_patch_size)
+        if num_patches <= 2:
+            return loss_ref.new_zeros(())
+
+        # Compute soft patch assignments from decoder latents (so boundary_proj gets gradients)
+        A = self.compute_assignments(decoder_latent)  # (B, num_patches, S)
+
+        # Encoder patches: soft-assignment-weighted mean (target, detached after pooling)
+        enc_patches = torch.bmm(A, encoder_latent)  # (B, num_patches, D)
+
+        # Decoder patches: combine soft assignment with within-patch gate importance
+        gate_inputs = F.rms_norm(decoder_latent, (D,))
+        gate_scores = (gate_inputs * self.gate.to(dtype=decoder_latent.dtype)[None, None, :]).sum(-1)  # (B, S)
+        gate_weights = torch.sigmoid(gate_scores * self.logit_scale.exp().to(dtype=gate_scores.dtype))  # (B, S)
+        # Element-wise multiply assignment rows by gate weights, then renormalize per patch
+        gated_A = A * gate_weights[:, None, :]  # (B, num_patches, S)
+        gated_A = gated_A / gated_A.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        dec_patches = torch.bmm(gated_A, decoder_latent)  # (B, num_patches, D)
+
+        # Predict next patch from decoder pooled representation
+        pred_patches = self.predictor(self.predictor_norm(dec_patches))
+        pred = F.normalize(pred_patches[:, :-1, :].float(), dim=-1)
+        tgt = F.normalize(enc_patches[:, 1:, :].detach().float(), dim=-1)
+        return (1.0 - F.cosine_similarity(pred, tgt, dim=-1)).mean()
+
+
 class SIGReg(nn.Module):
     # LeJEPA SIGReg: Sketched Isotropic Gaussian Regularization.
     # Encourages latent embeddings toward an isotropic Gaussian via characteristic-function matching.
@@ -684,6 +786,8 @@ class GPT(nn.Module):
         encoder_ratio: float = 0.5,
         latent_patch_size: int = 4,
         latent_patch_temperature: float = 2.0,
+        boundary_temperature: float = 1.0,
+        boundary_sharpness: float = 4.0,
         num_slices: int = 256,
     ):
         super().__init__()
@@ -708,7 +812,10 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.latent_patching = LatentPatching(model_dim, latent_patch_size, latent_patch_temperature)
+        self.latent_patching = LatentPatching(
+            model_dim, latent_patch_size, latent_patch_temperature,
+            boundary_temperature, boundary_sharpness,
+        )
         self.sigreg = SIGReg(num_slices=num_slices)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -872,6 +979,8 @@ def main() -> None:
         encoder_ratio=args.encoder_ratio,
         latent_patch_size=args.latent_patch_size,
         latent_patch_temperature=args.latent_patch_temperature,
+        boundary_temperature=args.boundary_temperature,
+        boundary_sharpness=args.boundary_sharpness,
         num_slices=args.sigreg_num_slices,
     ).to(device).bfloat16()
     for module in base_model.modules():
